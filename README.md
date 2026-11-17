@@ -17,6 +17,30 @@ It cannot change anything in Okta. It only requests read scopes and only makes G
 | `get_user_apps` | Apps assigned to a user, and whether each is direct or via a group |
 | `get_app_assignments` | Users and groups assigned to an app |
 
+## Architecture & Trust Boundary
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Analyst as IAM / SOC Analyst
+    participant Agent as OASIS Telemetry Agent
+    participant LLM as Anthropic Claude (Tool-Use)
+    participant Okta as Okta Identity Engine (OIE)
+    participant Audit as Local JSONL Audit Ledger
+
+    Analyst->>Agent: Submits Troubleshooting Query (e.g., MFA Lockout / App Access)
+    Agent->>LLM: Sends Prompt + Read-Only Tool Definitions
+    LLM-->>Agent: Requests Telemetry Tool Call
+    Agent->>Okta: POST /oauth2/v1/token (RS256 private_key_jwt Assertion)
+    Okta-->>Agent: Scoped Access Token (okta.logs.read, okta.users.read, okta.apps.read)
+    Agent->>Okta: GET /api/v1/logs (Paginated Query)
+    Okta-->>Agent: Raw System Log Events
+    Agent->>Agent: Slim Event Projection & Deterministic PII Redaction
+    Agent->>Audit: Append Invocation Metadata (agent_audit.log)
+    Agent->>LLM: Returns Minimized Telemetry Summary
+    LLM-->>Analyst: Root-Cause Diagnosis & Remediation Guidance
+```
+
 ## Requirements
 
 - Python 3.10+
