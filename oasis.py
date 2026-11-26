@@ -7,11 +7,12 @@ Setup:  pip install anthropic requests "pyjwt[crypto]"
 Auth:   OAuth 2.0 client credentials against the Okta org authorization server, using an
         API Services app (OIDC app type) with private_key_jwt client authentication.
 Env:    OKTA_ORG_URL=https://your-org.okta.com
-        OKTA_CLIENT_ID=0oa...                    (client ID of the API Services app)
+        OKTA_CLIENT_ID=0oa...                            (client ID of the API Services app)
         OKTA_PRIVATE_KEY_FILE=/path/to/private_key.pem   (private key, PEM or JWK; public half registered on the app)
-        OKTA_KEY_ID=...                          (optional kid; needed if the app has more than one key)
+        OKTA_KEY_ID=...                                  (optional kid; needed if the app has more than one key)
         OKTA_SCOPES=okta.logs.read okta.users.read okta.apps.read   (optional, space-separated; default below)
         ANTHROPIC_API_KEY=...
+        ANTHROPIC_MODEL=claude-sonnet-5-5                (optional override)
 Run:    python oasis.py                 (interactive prompt; "new" resets, "exit" quits)
         python oasis.py "why is jdoe@example.com failing to sign in today?"   (one question, then exit)
 Test tenant / lab data only until your org approves this.
@@ -31,14 +32,14 @@ TOKEN_URL = f"{ORG}/oauth2/v1/token"  # org authorization server (the only one t
 # Least privilege: logs for search_logs, users for get_user_status and the /users/{id}/factors listing,
 # apps for the app assignment tools.
 SCOPES = os.environ.get("OKTA_SCOPES", "okta.logs.read okta.users.read okta.apps.read")
-MODEL = "claude-sonnet-5"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 
-PAGE_SIZE = 100       # events per API page (Okta max 1000)
-MAX_PAGES = 10        # hard cap on pages fetched per query
-MAX_EVENTS = 1000     # hard cap on total events pulled per query
-SAMPLE_SIZE = 40      # events actually shown to the model (rest are summarized)
-MAX_ASSIGNEES = 1000  # hard cap on app users/groups fetched per app
-ASSIGNEE_SAMPLE = 200 # assigned users actually shown to the model (rest are counted)
+PAGE_SIZE = 100        # events per API page (Okta max 1000)
+MAX_PAGES = 10         # hard cap on pages fetched per query
+MAX_EVENTS = 1000      # hard cap on total events pulled per query
+SAMPLE_SIZE = 40       # events actually shown to the model (rest are summarized)
+MAX_ASSIGNEES = 1000   # hard cap on app users/groups fetched per app
+ASSIGNEE_SAMPLE = 200  # assigned users actually shown to the model (rest are counted)
 
 
 # ---------- auth ----------
@@ -46,7 +47,7 @@ _token = {"value": None, "expires_at": 0}
 
 
 def _private_key():
-    with open(os.environ["OKTA_PRIVATE_KEY_FILE"]) as f:
+    with open(os.environ["OKTA_PRIVATE_KEY_FILE"], encoding="utf-8") as f:
         raw = f.read().strip()
     return jwt.algorithms.RSAAlgorithm.from_jwk(raw) if raw.startswith("{") else raw
 
@@ -58,7 +59,14 @@ def _access_token():
     now = int(time.time())
     kid = os.environ.get("OKTA_KEY_ID")
     assertion = jwt.encode(
-        {"iss": CLIENT_ID, "sub": CLIENT_ID, "aud": TOKEN_URL, "iat": now, "exp": now + 300, "jti": str(uuid.uuid4())},
+        {
+            "iss": CLIENT_ID,
+            "sub": CLIENT_ID,
+            "aud": TOKEN_URL,
+            "iat": now,
+            "exp": now + 300,
+            "jti": str(uuid.uuid4()),
+        },
         _private_key(),
         algorithm="RS256",
         headers={"kid": kid} if kid else None,
@@ -223,233 +231,4 @@ def get_user_status(user):
         "created": u.get("created"),
         "activated": u.get("activated"),
         "statusChanged": u.get("statusChanged"),
-        "lastLogin": u.get("lastLogin"),
-        "lastUpdated": u.get("lastUpdated"),
-        "passwordChanged": u.get("passwordChanged"),
     }
-
-
-def get_user_authenticators(user):
-    """Enrolled factors/authenticators. Returns types and status only (no phone numbers or emails)."""
-    r = requests.get(f"{ORG}/api/v1/users/{_q(user)}", headers=_headers(), timeout=30)
-    if r.status_code == 404:
-        return {"error": "User not found"}
-    r.raise_for_status()
-    uid = r.json()["id"]
-    r = requests.get(f"{ORG}/api/v1/users/{uid}/factors", headers=_headers(), timeout=30)
-    r.raise_for_status()
-    out = []
-    for f in r.json():
-        out.append({
-            "factorType": f.get("factorType"),  # push, signed_nonce (FastPass), webauthn (passkey/security key), token:software:totp, sms, ...
-            "provider": f.get("provider"),
-            "status": f.get("status"),
-            "name": (f.get("profile") or {}).get("authenticatorName"),
-            "created": f.get("created"),
-            "lastUpdated": f.get("lastUpdated"),
-        })
-    return {"user_id": uid, "enrolled_count": len(out), "authenticators": out}
-
-
-def find_apps(query=None):
-    """Search apps by label/name, or list them when no query is given."""
-    params = {"limit": 200}
-    if query:
-        params["q"] = query
-    apps, truncated = _get_all(f"{ORG}/api/v1/apps", params, cap=200)
-    return {"count": len(apps), "truncated": truncated, "apps": [_slim_app(a) for a in apps]}
-
-
-def get_user_apps(user):
-    """Apps assigned to a user, with whether each came from a direct or group assignment."""
-    r = requests.get(f"{ORG}/api/v1/users/{_q(user)}", headers=_headers(), timeout=30)
-    if r.status_code == 404:
-        return {"error": "User not found"}
-    r.raise_for_status()
-    uid = r.json()["id"]
-    params = {"filter": f'user.id eq "{uid}"', "expand": f"user/{uid}", "limit": 200}
-    apps, truncated = _get_all(f"{ORG}/api/v1/apps", params)
-    out = []
-    for a in apps:
-        au = (a.get("_embedded") or {}).get("user") or {}
-        out.append({
-            **_slim_app(a),
-            "assignment": au.get("scope"),  # USER = assigned directly, GROUP = inherited from a group
-            "assignment_status": au.get("status"),
-            "app_username": (au.get("credentials") or {}).get("userName"),
-            "assigned": au.get("created"),
-        })
-    return {"user_id": uid, "app_count": len(out), "truncated": truncated, "apps": out}
-
-
-def get_app_assignments(app):
-    """Users and groups assigned to an app. Logins, assignment type and status only."""
-    a = _resolve_app(app)
-    if a.get("error"):
-        return a
-    base = f"{ORG}/api/v1/apps/{a['id']}"
-    groups, groups_truncated = _get_all(f"{base}/groups", {"limit": 200, "expand": "group"})
-    users, users_truncated = _get_all(f"{base}/users", {"limit": 500, "expand": "user"})
-    slim_users = [{
-        "user_id": u.get("id"),
-        "login": (((u.get("_embedded") or {}).get("user") or {}).get("profile") or {}).get("login"),
-        "app_username": (u.get("credentials") or {}).get("userName"),
-        "assignment": u.get("scope"),  # USER = assigned directly, GROUP = inherited from a group
-        "status": u.get("status"),
-        "assigned": u.get("created"),
-    } for u in users]
-    return {
-        "app": a,
-        "group_count": len(groups),
-        "groups": [{
-            "group_id": g.get("id"),
-            "name": (((g.get("_embedded") or {}).get("group") or {}).get("profile") or {}).get("name"),
-            "priority": g.get("priority"),
-        } for g in groups],
-        "user_count": len(slim_users),
-        "users_by_assignment": _top(collections.Counter(u["assignment"] for u in slim_users)),
-        "users_by_status": _top(collections.Counter(u["status"] for u in slim_users)),
-        "truncated": users_truncated or groups_truncated,
-        "note": f"Showing {ASSIGNEE_SAMPLE} of {len(slim_users)} users." if len(slim_users) > ASSIGNEE_SAMPLE else None,
-        "users": slim_users[:ASSIGNEE_SAMPLE],
-    }
-
-
-TOOL_FUNCS = {
-    "search_logs": search_logs,
-    "get_user_status": get_user_status,
-    "get_user_authenticators": get_user_authenticators,
-    "find_apps": find_apps,
-    "get_user_apps": get_user_apps,
-    "get_app_assignments": get_app_assignments,
-}
-
-TOOLS = [
-    {
-        "name": "search_logs",
-        "description": (
-            "Search Okta System Log (read-only). Auto-paginates and returns totals, breakdowns "
-            "(event, result, reason, IP, country, app) plus a sample of recent events. "
-            "Useful eventType values: user.session.start (sign-in), user.authentication.auth_via_mfa, "
-            "user.authentication.sso, user.account.lock, user.mfa.factor.activate, "
-            "policy.evaluate_sign_on, security.threat.detected. Use outcome=FAILURE for failures. "
-            "Max lookback 168 hours. If truncated=true, narrow the query."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "user": {"type": "string", "description": "Actor login/email"},
-                "event_type": {"type": "string"},
-                "outcome": {"type": "string", "enum": ["SUCCESS", "FAILURE", "SKIPPED", "ALLOW", "DENY", "CHALLENGE", "UNKNOWN"]},
-                "hours_back": {"type": "integer"},
-                "keyword": {"type": "string", "description": "Free-text q search"},
-            },
-        },
-    },
-    {
-        "name": "get_user_status",
-        "description": "Get a user's account state (ACTIVE, LOCKED_OUT, SUSPENDED, PASSWORD_EXPIRED, DEPROVISIONED...) and key timestamps (lastLogin, passwordChanged, statusChanged).",
-        "input_schema": {"type": "object", "properties": {"user": {"type": "string", "description": "Login/email or Okta user ID"}}, "required": ["user"]},
-    },
-    {
-        "name": "get_user_authenticators",
-        "description": "List the authenticators/factors a user has enrolled (Okta Verify push, FastPass, passkey/WebAuthn, TOTP, SMS, etc.) with status. Use when diagnosing MFA failures or lockouts.",
-        "input_schema": {"type": "object", "properties": {"user": {"type": "string", "description": "Login/email or Okta user ID"}}, "required": ["user"]},
-    },
-    {
-        "name": "find_apps",
-        "description": "Search Okta app integrations by label/name (prefix match), or list apps when query is omitted. Returns id, label, status (ACTIVE/INACTIVE) and sign-on mode. Use to resolve an app name to its id.",
-        "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "Start of the app label, e.g. 'Salesforce'"}}},
-    },
-    {
-        "name": "get_user_apps",
-        "description": "List the apps assigned to a user. assignment=USER means assigned directly, GROUP means inherited from a group. Use for 'what apps does X have' or 'does X have access to Y'.",
-        "input_schema": {"type": "object", "properties": {"user": {"type": "string", "description": "Login/email or Okta user ID"}}, "required": ["user"]},
-    },
-    {
-        "name": "get_app_assignments",
-        "description": "List the groups and users assigned to an app, with counts by assignment type (USER direct / GROUP inherited) and status. Use for 'who has access to app Y' or 'which groups grant app Y'. If truncated=true, counts are a lower bound.",
-        "input_schema": {"type": "object", "properties": {"app": {"type": "string", "description": "App label or Okta app ID (0oa...)"}}, "required": ["app"]},
-    },
-]
-
-SYSTEM = (
-    "You are OASIS (Okta Access Security Intelligence System), a read-only IAM troubleshooting assistant for Okta. "
-    "Use the tools to investigate. "
-    "Start with get_user_status when a specific user is named; check authenticators when MFA is involved; "
-    "use search_logs for the timeline. For app access questions use get_user_apps (one user) or "
-    "get_app_assignments (one app), and say whether access is direct or via a group. Summarize: what happened, the pattern (IPs, apps, factor, reason codes), "
-    "likely cause, and a suggested next step. Say when results were truncated. "
-    "Never claim certainty the data doesn't support. You cannot change anything."
-)
-
-
-def audit(name, args, user=None):
-    entry = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(), "tool": name, "args": args}
-    if user:
-        entry["user"] = user  # set by the web front end (app.py), where several people share one deployment
-    with open("agent_audit.log", "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-
-def ask(client, messages, question):
-    """Run one question to completion. Appends to messages so follow-ups keep context."""
-    messages.append({"role": "user", "content": question})
-    for _ in range(8):  # hard loop cap
-        print("[asking OASIS...]", file=sys.stderr, flush=True)
-        resp = client.messages.create(model=MODEL, max_tokens=2000, system=SYSTEM, tools=TOOLS, messages=messages)
-        messages.append({"role": "assistant", "content": resp.content})
-        if resp.stop_reason != "tool_use":
-            print("".join(b.text for b in resp.content if b.type == "text"))
-            return
-        results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                audit(b.name, b.input)
-                print(f"[calling Okta: {b.name} {json.dumps(b.input)}]", file=sys.stderr, flush=True)
-                try:
-                    out = TOOL_FUNCS[b.name](**b.input)
-                except Exception as ex:
-                    out = {"error": str(ex)}
-                if isinstance(out, dict) and out.get("error"):
-                    print(f"[Okta error: {out['error']}]", file=sys.stderr, flush=True)
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": json.dumps(out)})
-        messages.append({"role": "user", "content": results})
-    print("Stopped: too many tool calls.")
-
-
-def chat(client):
-    """Interactive prompt. Follow-up questions share context until 'new' clears it."""
-    print("OASIS: Okta Access Security Intelligence System (read-only). Type a question, 'new' to start a fresh conversation, 'exit' to quit.")
-    messages = []
-    while True:
-        try:
-            question = input("\noasis> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if not question:
-            continue
-        if question.lower() in ("exit", "quit"):
-            return
-        if question.lower() == "new":
-            messages = []
-            print("Started a new conversation.")
-            continue
-        checkpoint = len(messages)
-        try:
-            ask(client, messages, question)
-        except KeyboardInterrupt:
-            del messages[checkpoint:]  # drop the half-finished turn so the history stays valid
-            print("\nCancelled.")
-        except Exception as ex:
-            del messages[checkpoint:]
-            print(f"Error: {ex}")
-
-
-if __name__ == "__main__":
-    client = anthropic.Anthropic()
-    if len(sys.argv) > 1:
-        ask(client, [], " ".join(sys.argv[1:]))
-    else:
-        chat(client)
