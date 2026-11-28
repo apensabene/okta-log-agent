@@ -14,6 +14,8 @@ Env:    everything oasis.py needs, plus an Okta OIDC Web app for tester sign-in:
 Run:    chainlit run app.py
 """
 import os, sys, json, asyncio
+from urllib.parse import quote
+import requests
 import anthropic
 import chainlit as cl
 
@@ -67,9 +69,41 @@ async def ask(messages, question, user):
     return "Stopped: too many tool calls."
 
 
+_ALLOWED_USER_STATUSES = {"ACTIVE", "PASSWORD_EXPIRED", "RECOVERY"}
+
+
+def _still_authorized(identifier):
+    """Re-check against Okta that the user is enabled and still assigned to the OIDC sign-in app.
+    Fails closed: any error or unexpected response denies access."""
+    app_id = os.environ.get("OAUTH_OKTA_CLIENT_ID")
+    if not identifier or not app_id:
+        return False
+    try:
+        r = requests.get(f"{oasis.ORG}/api/v1/users/{quote(identifier, safe='')}", headers=oasis._headers(), timeout=15)
+        if r.status_code != 200:
+            return False
+        u = r.json()
+        if u.get("status") not in _ALLOWED_USER_STATUSES or not u.get("id"):
+            return False
+        r = requests.get(
+            f"{oasis.ORG}/api/v1/apps/{quote(app_id, safe='')}/users/{quote(u['id'], safe='')}",
+            headers=oasis._headers(), timeout=15,
+        )
+        if r.status_code != 200:
+            return False
+        return r.json().get("status") != "INACTIVE"
+    except Exception:
+        return False
+
+
 @cl.on_message
 async def on_message(message: cl.Message):
-    user = cl.user_session.get("user").identifier
+    current = cl.user_session.get("user")
+    # A restored session does not rerun the OAuth callback, so authorization is re-validated on every message.
+    if current is None or not await cl.make_async(_still_authorized)(current.identifier):
+        await cl.Message(content="Access denied: your account is no longer authorized to use this application.").send()
+        return
+    user = current.identifier
     messages = cl.user_session.get("messages")
     checkpoint = len(messages)
     try:
