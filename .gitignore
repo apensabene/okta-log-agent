@@ -1,19 +1,47 @@
 # Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
 
 # Runtime output: contains the logins and queries you investigated
 agent_audit.log
 *.log
 
-# Secrets
+# Secrets & local config
 .env
+.env.*
+!.env.example
 *.pem
 *.key
 *.jwk
+*.p12
+*.pfx
 private_key*
 
-# Chainlit: generated at startup
-.chainlit/translations/
-.files/
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
